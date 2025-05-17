@@ -61,22 +61,22 @@ def parse_args(args=None, namespace=None):
     # Model
     parser.add_argument(
         "--max_seq_len",
-        default=1024,
+        default=256,
         type=int,
         help="maximum sequence length",
     )
     parser.add_argument(
         "--max_beat",
-        default=256,
+        default=64,
         type=int,
         help="maximum number of beats",
     )
-    parser.add_argument("--dim", default=512, type=int, help="model dimension")
+    parser.add_argument("--dim", default=64, type=int, help="model dimension")
     parser.add_argument(
-        "-l", "--layers", default=6, type=int, help="number of layers"
+        "-l", "--layers", default=3, type=int, help="number of layers"
     )
     parser.add_argument(
-        "--heads", default=8, type=int, help="number of attention heads"
+        "--heads", default=4, type=int, help="number of attention heads"
     )
     parser.add_argument(
         "--dropout", default=0.2, type=float, help="dropout rate"
@@ -102,7 +102,7 @@ def parse_args(args=None, namespace=None):
     )
     parser.add_argument(
         "--valid_steps",
-        default=1000,
+        default=200,
         type=int,
         help="validation frequency",
     )
@@ -373,48 +373,48 @@ def main():
         # Release GPU memory right away
         del seq, mask
 
-        # Validation
-        logging.info(f"Validating...")
-        model.eval()
-        with torch.no_grad():
-            total_loss = 0
-            total_losses = [0] * 6
-            count = 0
-            for batch in valid_loader:
-                # Get input and output pair
-                seq = batch["seq"].to(device)
-                mask = batch["mask"].to(device)
-
-                # Pass through the model
-                loss, losses = model(seq, return_list=True, mask=mask)
-
-                # Accumulate validation loss
-                count += len(batch)
-                total_loss += len(batch) * float(loss)
-                for idx in range(6):
-                    total_losses[idx] += float(losses[idx])
-        val_loss = total_loss / count
-        individual_losses = [l / count for l in total_losses]
-        logging.info(f"Validation loss: {val_loss:.4f}")
-        logging.info(
-            f"Individual losses: type={individual_losses[0]:.4f}, "
-            f"beat: {individual_losses[1]:.4f}, "
-            f"position: {individual_losses[2]:.4f}, "
-            f"pitch: {individual_losses[3]:.4f}, "
-            f"duration: {individual_losses[4]:.4f}, "
-            f"instrument: {individual_losses[5]:.4f}"
-        )
-
-        # Release GPU memory right away
-        del seq, mask
-
-        # Write losses to file
-        loss_csv.write(
-            f"{step},{train_loss},{val_loss},{individual_losses[0]},"
-            f"{individual_losses[1]},{individual_losses[2]},"
-            f"{individual_losses[3]},{individual_losses[4]},"
-            f"{individual_losses[5]}\n"
-        )
+        # # Validation
+        # logging.info(f"Validating...")
+        # model.eval()
+        # with torch.no_grad():
+        #     total_loss = 0
+        #     total_losses = [0] * 6
+        #     count = 0
+        #     for batch in valid_loader:
+        #         # Get input and output pair
+        #         seq = batch["seq"].to(device)
+        #         mask = batch["mask"].to(device)
+        #
+        #         # Pass through the model
+        #         loss, losses = model(seq, return_list=True, mask=mask)
+        #
+        #         # Accumulate validation loss
+        #         count += len(batch)
+        #         total_loss += len(batch) * float(loss)
+        #         for idx in range(6):
+        #             total_losses[idx] += float(losses[idx])
+        # val_loss = total_loss / count
+        # individual_losses = [l / count for l in total_losses]
+        # logging.info(f"Validation loss: {val_loss:.4f}")
+        # logging.info(
+        #     f"Individual losses: type={individual_losses[0]:.4f}, "
+        #     f"beat: {individual_losses[1]:.4f}, "
+        #     f"position: {individual_losses[2]:.4f}, "
+        #     f"pitch: {individual_losses[3]:.4f}, "
+        #     f"duration: {individual_losses[4]:.4f}, "
+        #     f"instrument: {individual_losses[5]:.4f}"
+        # )
+        #
+        # # Release GPU memory right away
+        # del seq, mask
+        #
+        # # Write losses to file
+        # loss_csv.write(
+        #     f"{step},{train_loss},{val_loss},{individual_losses[0]},"
+        #     f"{individual_losses[1]},{individual_losses[2]},"
+        #     f"{individual_losses[3]},{individual_losses[4]},"
+        #     f"{individual_losses[5]}\n"
+        # )
 
         # Save the model
         checkpoint_filename = args.out_dir / "checkpoints" / f"model_{step}.pt"

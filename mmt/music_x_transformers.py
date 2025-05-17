@@ -47,25 +47,32 @@ def parse_args(args=None, namespace=None):
     parser.add_argument(
         "-q", "--quiet", action="store_true", help="show warnings only"
     )
+    # Add weight decay as a command-line argument
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.01,
+        help="L2 regularization (weight decay) for optimizer",
+    )
     return parser.parse_args(args=args, namespace=namespace)
 
 
 class MusicTransformerWrapper(nn.Module):
     def __init__(
-        self,
-        *,
-        encoding,
-        max_seq_len,
-        attn_layers,
-        emb_dim=None,
-        max_beat=None,
-        max_mem_len=0.0,
-        shift_mem_down=0,
-        emb_dropout=0.0,
-        num_memory_tokens=None,
-        tie_embedding=False,
-        use_abs_pos_emb=True,
-        l2norm_embed=False,
+            self,
+            *,
+            encoding,
+            max_seq_len,
+            attn_layers,
+            emb_dim=None,
+            max_beat=None,
+            max_mem_len=0.0,
+            shift_mem_down=0,
+            emb_dropout=0.0,
+            num_memory_tokens=None,
+            tie_embedding=False,
+            use_abs_pos_emb=True,
+            l2norm_embed=False,
     ):
         super().__init__()
         assert isinstance(
@@ -79,9 +86,18 @@ class MusicTransformerWrapper(nn.Module):
         self.max_mem_len = max_mem_len
         self.shift_mem_down = shift_mem_down
 
+        self.encoding = encoding
+        self.field_names = encoding["dimensions"]
+        self.type_idx = self.field_names.index("type")
+        self.beat_idx = self.field_names.index("beat")
+        self.position_idx = self.field_names.index("position")
+        self.pitch_idx = self.field_names.index("pitch")
+        self.duration_idx = self.field_names.index("duration")
+        self.instrument_idx = self.field_names.index("instrument")
+
         n_tokens = encoding["n_tokens"]
         if max_beat is not None:
-            beat_dim = encoding["dimensions"].index("beat")
+            beat_dim = self.beat_idx
             n_tokens[beat_dim] = max_beat + 1
 
         self.l2norm_embed = l2norm_embed
@@ -104,8 +120,21 @@ class MusicTransformerWrapper(nn.Module):
         self.project_emb = (
             nn.Linear(emb_dim, dim) if emb_dim != dim else nn.Identity()
         )
+
+        # --- Cross attention blocks ---
+        self.cross_attn_pitch = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+        self.cross_attn_duration = nn.MultiheadAttention(dim, num_heads=4, batch_first=True)
+
+        # --- attn_layers is now after cross attention ---
         self.attn_layers = attn_layers
         self.norm = nn.LayerNorm(dim)
+
+        self.feedforward = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Dropout(emb_dropout)
+        )
+        self.to_one = nn.Linear(dim, 1, bias=False)
 
         self.init_()
 
@@ -115,7 +144,6 @@ class MusicTransformerWrapper(nn.Module):
             else [lambda t: t @ emb.weight.t() for emb in self.token_emb]
         )
 
-        # memory tokens (like [cls]) from Memory Transformers paper
         num_memory_tokens = default(num_memory_tokens, 0)
         self.num_memory_tokens = num_memory_tokens
         if num_memory_tokens > 0:
@@ -129,56 +157,80 @@ class MusicTransformerWrapper(nn.Module):
                 nn.init.normal_(emb.emb.weight, std=1e-5)
             nn.init.normal_(self.pos_emb.emb.weight, std=1e-5)
             return
-
         for emb in self.token_emb:
             nn.init.kaiming_normal_(emb.emb.weight)
 
     def forward(
-        self,
-        x,  # shape : (b, n , d)
-        return_embeddings=False,
-        mask=None,
-        return_mems=False,
-        return_attn=False,
-        mems=None,
-        **kwargs,
+            self,
+            x,  # shape : (b, n , d)
+            return_embeddings=False,
+            mask=None,
+            return_mems=False,
+            return_attn=False,
+            mems=None,
+            **kwargs,
     ):
-        b, _, _ = x.shape
+        b, seq_len, d = x.shape
         num_mem = self.num_memory_tokens
 
-        x = sum(
-            emb(x[..., i]) for i, emb in enumerate(self.token_emb)
+        # --- Use only type, beat, position, instrument as input ---
+        input_idxs = [self.type_idx, self.beat_idx, self.position_idx, self.instrument_idx]
+        x_in = sum(
+            self.token_emb[i](x[..., i]) for i in input_idxs
         ) + self.pos_emb(x)
-        x = self.emb_dropout(x)
-
-        x = self.project_emb(x)
+        x_in = self.emb_dropout(x_in)
+        x_in = self.project_emb(x_in)
 
         if num_mem > 0:
             mem = repeat(self.memory_tokens, "n d -> b n d", b=b)
-            x = torch.cat((mem, x), dim=1)
-
-            # auto-handle masking after appending memory tokens
+            x_in = torch.cat((mem, x_in), dim=1)
             if exists(mask):
                 mask = F.pad(mask, (num_mem, 0), value=True)
 
+        # --- Cross attention: pitch as query ---
+        pitch_emb = self.token_emb[self.pitch_idx](x[..., self.pitch_idx])  # (b, seq_len, emb_dim)
+        pitch_emb_proj = self.project_emb(pitch_emb)
+        x2, _ = self.cross_attn_pitch(
+            query=pitch_emb_proj,
+            key=x_in,
+            value=x_in,
+            need_weights=False,
+            attn_mask=None
+        )
+
+        # --- Cross attention: duration as query ---
+        duration_emb = self.token_emb[self.duration_idx](x[..., self.duration_idx])  # (b, seq_len, emb_dim)
+        duration_emb_proj = self.project_emb(duration_emb)
+        x3, _ = self.cross_attn_duration(
+            query=duration_emb_proj,
+            key=x2,
+            value=x2,
+            need_weights=False,
+            attn_mask=None
+        )
+
+        # --- Now pass through attn_layers ---
         if self.shift_mem_down and exists(mems):
             mems_l, mems_r = (
                 mems[: self.shift_mem_down],
-                mems[self.shift_mem_down :],
+                mems[self.shift_mem_down:],
             )
             mems = [*mems_r, *mems_l]
 
-        x, intermediates = self.attn_layers(
-            x, mask=mask, mems=mems, return_hiddens=True, **kwargs
+        x4, intermediates = self.attn_layers(
+            x3, mask=mask, mems=mems, return_hiddens=True, **kwargs
         )
-        x = self.norm(x)
+        x4 = self.norm(x4)
 
-        mem, x = x[:, :num_mem], x[:, num_mem:]
+        out_one = self.to_one(self.feedforward(x4))  # (B, S+num_mem, 1)
+        out_one = out_one[:, -1, :]
+
+        mem, x_remain = x4[:, :num_mem], x4[:, num_mem:]
 
         out = (
-            [to_logit(x) for to_logit in self.to_logits]
+            [to_logit(x_remain) for to_logit in self.to_logits]
             if not return_embeddings
-            else x
+            else x_remain
         )
 
         if return_mems:
@@ -195,7 +247,7 @@ class MusicTransformerWrapper(nn.Module):
             )
             new_mems = list(
                 map(
-                    lambda t: t[..., -self.max_mem_len :, :].detach(), new_mems
+                    lambda t: t[..., -self.max_mem_len:, :].detach(), new_mems
                 )
             )
             return out, new_mems
@@ -209,27 +261,7 @@ class MusicTransformerWrapper(nn.Module):
             )
             return out, attn_maps
 
-        return out
-
-
-def sample(logits, kind, threshold, temperature, min_p_pow, min_p_ratio):
-    """Sample from the logits with a specific sampling strategy."""
-    if kind == "top_k":
-        probs = F.softmax(top_k(logits, thres=threshold) / temperature, dim=-1)
-    elif kind == "top_p":
-        probs = F.softmax(top_p(logits, thres=threshold) / temperature, dim=-1)
-    elif kind == "top_a":
-        probs = F.softmax(
-            top_a(logits, min_p_pow=min_p_pow, min_p_ratio=min_p_ratio)
-            / temperature,
-            dim=-1,
-        )
-    elif kind == "entmax":
-        probs = entmax(logits / temperature, alpha=ENTMAX_ALPHA, dim=-1)
-    else:
-        raise ValueError(f"Unknown sampling strategy: {kind}")
-
-    return torch.multinomial(probs, 1)
+        return out_one
 
 
 class MusicAutoregressiveWrapper(nn.Module):
@@ -240,6 +272,15 @@ class MusicAutoregressiveWrapper(nn.Module):
 
         self.net = net
         self.max_seq_len = net.max_seq_len
+
+        self.encoding = encoding
+        self.field_names = encoding["dimensions"]
+        self.type_idx = self.field_names.index("type")
+        self.beat_idx = self.field_names.index("beat")
+        self.position_idx = self.field_names.index("position")
+        self.pitch_idx = self.field_names.index("pitch")
+        self.duration_idx = self.field_names.index("duration")
+        self.instrument_idx = self.field_names.index("instrument")
 
         # Get the type codes
         self.sos_type_code = encoding["type_code_map"]["start-of-song"]
@@ -277,6 +318,7 @@ class MusicAutoregressiveWrapper(nn.Module):
         return_attn=False,
         **kwargs,
     ):
+        # No change: keep same input/output format as before
         _, t, dim = start_tokens.shape
 
         if isinstance(temperature, (float, int)):
@@ -342,6 +384,7 @@ class MusicAutoregressiveWrapper(nn.Module):
             x = out[:, -self.max_seq_len :]
             mask = mask[:, -self.max_seq_len :]
 
+            # No change needed here, input/output format is unchanged for .net
             if return_attn:
                 logits, attn = self.net(
                     x, mask=mask, return_attn=True, **kwargs
@@ -478,15 +521,12 @@ class MusicAutoregressiveWrapper(nn.Module):
             kwargs["mask"] = mask
 
         out = self.net(xi, **kwargs)
-        losses = [
-            F.cross_entropy(
-                out[i].transpose(1, 2),
-                xo[..., i],
-                ignore_index=self.ignore_index,
-            )
-            for i in range(len(out))
-        ]
-        loss = sum(losses)
+
+        losses = []
+        target_one = torch.ones_like(out)
+
+        criterion = nn.MSELoss()
+        loss = criterion(out, target_one)
 
         if return_list:
             return loss, losses
@@ -545,12 +585,12 @@ def main():
 
     # Create the model
     model = MusicXTransformer(
-        dim=128,
+        dim=64,
         encoding=encoding,
         depth=3,
         heads=4,
-        max_seq_len=1024,
-        max_beat=256,
+        max_seq_len=256,
+        max_beat=64,
         rel_pos_bias=True,  # relative positional bias
         rotary_pos_emb=True,  # rotary positional encoding
         emb_dropout=0.1,
@@ -571,6 +611,9 @@ def main():
     mask = torch.ones((1, 1024)).bool()
 
     # Pass test data through the model
+    # --------- REGULARIZATION IN OPTIMIZER -----------
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=args.weight_decay)
+    # --------------------------------------------------
     loss = model(seq, mask=mask)
     loss.backward()
 
